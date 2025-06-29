@@ -9,7 +9,8 @@ import (
 
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/storage"
+
+	"github.com/cloudflare/parquet-tsdb-poc/db"
 )
 
 type apiConfig struct {
@@ -24,7 +25,7 @@ func QueryOptions(opts ...QueryAPIOption) APIOption {
 	}
 }
 
-func NewAPI(queryable storage.Queryable, engine promql.QueryEngine, opts ...APIOption) http.Handler {
+func NewAPI(db *db.DB, engine promql.QueryEngine, opts ...APIOption) http.Handler {
 	cfg := &apiConfig{}
 	for i := range opts {
 		opts[i](cfg)
@@ -33,7 +34,7 @@ func NewAPI(queryable storage.Queryable, engine promql.QueryEngine, opts ...APIO
 	r := route.New()
 
 	api := r.WithPrefix("/api/v1")
-	RegisterQueryV1(api, queryable, engine, cfg.queryAPIOpts...)
+	RegisterQueryV1(api, db, engine, cfg.queryAPIOpts...)
 
 	return r
 }

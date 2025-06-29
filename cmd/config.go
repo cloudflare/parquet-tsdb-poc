@@ -8,9 +8,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/pprof"
 	"strings"
+	"time"
 
-	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/yaml.v3"
 
 	"go.opentelemetry.io/otel"
@@ -20,9 +22,27 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 
+	"github.com/alecthomas/units"
+	"github.com/oklog/run"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
+	"github.com/thanos-io/thanos/pkg/runutil"
+
+	"github.com/cloudflare/parquet-tsdb-poc/locate"
 )
+
+func setupInterrupt(ctx context.Context, g *run.Group, log *slog.Logger) {
+	ctx, cancel := context.WithCancel(ctx)
+	g.Add(func() error {
+		<-ctx.Done()
+		log.Info("Canceling actors")
+		return nil
+	}, func(error) {
+		cancel()
+	})
+}
 
 type bucketOpts struct {
 	storage string
@@ -41,57 +61,21 @@ type bucketOpts struct {
 	retries int
 }
 
-func (opts *bucketOpts) registerFlags(cmd *kingpin.CmdClause) {
-	cmd.Flag("storage.type", "type of storage").Default("filesystem").EnumVar(&opts.storage, "filesystem", "s3")
-	cmd.Flag("storage.prefix", "prefix for the storage").Default("").StringVar(&opts.prefix)
-	cmd.Flag("storage.filesystem.directory", "directory for filesystem").Default(".data").StringVar(&opts.filesystemDirectory)
-	cmd.Flag("storage.s3.bucket", "bucket for s3").Default("").StringVar(&opts.s3Bucket)
-	cmd.Flag("storage.s3.endpoint", "endpoint for s3").Default("").StringVar(&opts.s3Endpoint)
-	cmd.Flag("storage.s3.access_key", "access key for s3").Default("").Envar("STORAGE_S3_ACCESS_KEY").StringVar(&opts.s3AccessKey)
-	cmd.Flag("storage.s3.secret_key", "secret key for s3").Default("").Envar("STORAGE_S3_SECRET_KEY").StringVar(&opts.s3SecretKey)
-	cmd.Flag("storage.s3.insecure", "use http").Default("false").BoolVar(&opts.s3Insecure)
-	cmd.Flag("storage.retries", "how many retries to perform").Default("2").IntVar(&opts.retries)
-}
-
-func (opts *bucketOpts) registerParquetFlags(cmd *kingpin.CmdClause) {
-	cmd.Flag("parquet.storage.type", "type of storage").Default("filesystem").EnumVar(&opts.storage, "filesystem", "s3")
-	cmd.Flag("parquet.storage.prefix", "prefix for the storage").Default("").StringVar(&opts.prefix)
-	cmd.Flag("parquet.storage.filesystem.directory", "directory for filesystem").Default(".data").StringVar(&opts.filesystemDirectory)
-	cmd.Flag("parquet.storage.s3.bucket", "bucket for s3").Default("").StringVar(&opts.s3Bucket)
-	cmd.Flag("parquet.storage.s3.endpoint", "endpoint for s3").Default("").StringVar(&opts.s3Endpoint)
-	cmd.Flag("parquet.storage.s3.access_key", "access key for s3").Default("").Envar("PARQUET_STORAGE_S3_ACCESS_KEY").StringVar(&opts.s3AccessKey)
-	cmd.Flag("parquet.storage.s3.secret_key", "secret key for s3").Default("").Envar("PARQUET_STORAGE_S3_SECRET_KEY").StringVar(&opts.s3SecretKey)
-	cmd.Flag("parquet.storage.s3.insecure", "use http").Default("false").BoolVar(&opts.s3Insecure)
-	cmd.Flag("parquet.storage.retries", "how many retries to perform").Default("2").IntVar(&opts.retries)
-}
-
-func (opts *bucketOpts) registerTSDBFlags(cmd *kingpin.CmdClause) {
-	cmd.Flag("tsdb.storage.type", "type of storage").Default("filesystem").EnumVar(&opts.storage, "filesystem", "s3")
-	cmd.Flag("tsdb.storage.prefix", "prefix for the storage").Default("").StringVar(&opts.prefix)
-	cmd.Flag("tsdb.storage.filesystem.directory", "directory for filesystem").Default(".data").StringVar(&opts.filesystemDirectory)
-	cmd.Flag("tsdb.storage.s3.bucket", "bucket for s3").Default("").StringVar(&opts.s3Bucket)
-	cmd.Flag("tsdb.storage.s3.endpoint", "endpoint for s3").Default("").StringVar(&opts.s3Endpoint)
-	cmd.Flag("tsdb.storage.s3.access_key", "access key for s3").Default("").Envar("TSDB_STORAGE_S3_ACCESS_KEY").StringVar(&opts.s3AccessKey)
-	cmd.Flag("tsdb.storage.s3.secret_key", "secret key for s3").Default("").Envar("TSDB_STORAGE_S3_SECRET_KEY").StringVar(&opts.s3SecretKey)
-	cmd.Flag("tsdb.storage.s3.insecure", "use http").Default("false").BoolVar(&opts.s3Insecure)
-	cmd.Flag("tsdb.storage.retries", "how many retries to perform").Default("2").IntVar(&opts.retries)
-}
-
 func setupBucket(log *slog.Logger, opts bucketOpts) (objstore.Bucket, error) {
-	prov := client.ObjProvider(strings.ToUpper(opts.storage))
+	prov := objstore.ObjProvider(strings.ToUpper(opts.storage))
 	cfg := client.BucketConfig{
 		Type:   prov,
 		Prefix: opts.prefix,
 	}
 	var subCfg any
 	switch prov {
-	case client.FILESYSTEM:
+	case objstore.FILESYSTEM:
 		subCfg = struct {
 			Directory string `yaml:"directory"`
 		}{
 			Directory: opts.filesystemDirectory,
 		}
-	case client.S3:
+	case objstore.S3:
 		subCfg = struct {
 			Bucket     string `yaml:"bucket"`
 			Endpoint   string `yaml:"endpoint"`
@@ -129,7 +113,7 @@ type slogAdapter struct {
 	log *slog.Logger
 }
 
-func (s slogAdapter) Log(args ...interface{}) error {
+func (s slogAdapter) Log(args ...any) error {
 	s.log.Debug("", args...)
 	return nil
 }
@@ -142,13 +126,6 @@ type tracingOpts struct {
 
 	samplingParam float64
 	samplingType  string
-}
-
-func (opts *tracingOpts) registerFlags(cmd *kingpin.CmdClause) {
-	cmd.Flag("tracing.exporter.type", "type of tracing exporter").Default("STDOUT").EnumVar(&opts.exporterType, "JAEGER", "STDOUT")
-	cmd.Flag("tracing.jaeger.endpoint", "endpoint to send traces, eg. https://example.com:4318/v1/traces").StringVar(&opts.jaegerEndpoint)
-	cmd.Flag("tracing.sampling.param", "sample of traces to send").Default("0.1").Float64Var(&opts.samplingParam)
-	cmd.Flag("tracing.sampling.type", "type of sampling").Default("PROBABILISTIC").EnumVar(&opts.samplingType, "PROBABILISTIC", "ALWAYS", "NEVER")
 }
 
 func setupTracing(ctx context.Context, opts tracingOpts) error {
@@ -198,4 +175,210 @@ func setupTracing(ctx context.Context, opts tracingOpts) error {
 	)
 	otel.SetTracerProvider(tracerProvider)
 	return nil
+}
+
+type apiOpts struct {
+	port int
+
+	shutdownTimeout time.Duration
+}
+
+func setupInternalAPI(g *run.Group, log *slog.Logger, reg *prometheus.Registry, opts apiOpts) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+
+	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+
+	server := &http.Server{Addr: fmt.Sprintf(":%d", opts.port), Handler: mux}
+	g.Add(func() error {
+		log.Info("Serving internal api", slog.Int("port", opts.port))
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	}, func(error) {
+		log.Info("Shutting down internal api", slog.Int("port", opts.port))
+		ctx, cancel := context.WithTimeout(context.Background(), opts.shutdownTimeout)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Error("Error shutting down internal server", slog.Any("err", err))
+		}
+	})
+}
+
+type discoveryOpts struct {
+	discoveryInterval    time.Duration
+	discoveryConcurrency int
+}
+
+func setupDiscovery(ctx context.Context, g *run.Group, log *slog.Logger, bkt objstore.Bucket, opts discoveryOpts) (*locate.Discoverer, error) {
+	discoverer := locate.NewDiscoverer(bkt, locate.MetaConcurrency(opts.discoveryConcurrency))
+
+	log.Info("Running initial discovery")
+
+	iterCtx, iterCancel := context.WithTimeout(ctx, opts.discoveryInterval)
+	defer iterCancel()
+	if err := discoverer.Discover(iterCtx); err != nil {
+		return nil, fmt.Errorf("unable to run initial discovery: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	g.Add(func() error {
+		return runutil.Repeat(opts.discoveryInterval, ctx.Done(), func() error {
+			log.Debug("Running discovery")
+
+			iterCtx, iterCancel := context.WithTimeout(ctx, opts.discoveryInterval)
+			defer iterCancel()
+			if err := discoverer.Discover(iterCtx); err != nil {
+				log.Warn("Unable to discover new blocks", slog.Any("err", err))
+			}
+			return nil
+		})
+	}, func(error) {
+		log.Info("Stopping discovery")
+		cancel()
+	})
+	return discoverer, nil
+}
+
+type tsdbDiscoveryOpts struct {
+	discoveryInterval    time.Duration
+	discoveryConcurrency int
+	discoveryMinBlockAge time.Duration
+
+	externalLabelMatchers matcherSlice
+}
+
+func setupTSDBDiscovery(ctx context.Context, g *run.Group, log *slog.Logger, bkt objstore.Bucket, opts tsdbDiscoveryOpts) (*locate.TSDBDiscoverer, error) {
+	discoverer := locate.NewTSDBDiscoverer(
+		bkt,
+		locate.TSDBMetaConcurrency(opts.discoveryConcurrency),
+		locate.TSDBMinBlockAge(opts.discoveryMinBlockAge),
+		locate.TSDBMatchExternalLabels(opts.externalLabelMatchers...),
+	)
+
+	log.Info("Running initial tsdb discovery")
+
+	iterCtx, iterCancel := context.WithTimeout(ctx, opts.discoveryInterval)
+	defer iterCancel()
+	if err := discoverer.Discover(iterCtx); err != nil {
+		return nil, fmt.Errorf("unable to run initial discovery: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	g.Add(func() error {
+		return runutil.Repeat(opts.discoveryInterval, ctx.Done(), func() error {
+			log.Debug("Running tsdb discovery")
+
+			iterCtx, iterCancel := context.WithTimeout(ctx, opts.discoveryInterval)
+			defer iterCancel()
+			if err := discoverer.Discover(iterCtx); err != nil {
+				log.Warn("Unable to discover new tsdb blocks", slog.Any("err", err))
+			}
+			return nil
+		})
+	}, func(error) {
+		log.Info("Stopping tsdb discovery")
+		cancel()
+	})
+	return discoverer, nil
+}
+
+type syncerOpts struct {
+	syncerInterval       time.Duration
+	syncerConcurrency    int
+	syncerReadBufferSize units.Base2Bytes
+	syncerLabelFilesDir  string
+
+	filterType                         string
+	filterThanosBackfillEndpoint       string
+	filterThanosBackfillUpdateInterval time.Duration
+	filterThanosBackfillOverlap        time.Duration
+}
+
+func setupMetaFilter(ctx context.Context, g *run.Group, log *slog.Logger, opts syncerOpts) (locate.MetaFilter, error) {
+	switch opts.filterType {
+	case "all-metas":
+		return locate.AllMetasMetaFilter, nil
+	case "thanos-backfill":
+		thanosBackfillMetaFilter := locate.NewThanosBackfillMetaFilter(opts.filterThanosBackfillEndpoint, opts.filterThanosBackfillOverlap)
+
+		log.Info("Initializing thanos-backfill meta filter")
+
+		iterCtx, iterCancel := context.WithTimeout(ctx, opts.filterThanosBackfillUpdateInterval)
+		defer iterCancel()
+		if err := thanosBackfillMetaFilter.Update(iterCtx); err != nil {
+			return nil, fmt.Errorf("unable to initialize thanos-backfill meta filter: %w", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			return runutil.Repeat(opts.filterThanosBackfillUpdateInterval, ctx.Done(), func() error {
+				log.Debug("Updating thanos-backfill meta filter")
+
+				iterCtx, iterCancel := context.WithTimeout(ctx, opts.filterThanosBackfillUpdateInterval)
+				defer iterCancel()
+				if err := thanosBackfillMetaFilter.Update(iterCtx); err != nil {
+					log.Warn("Unable to update thanos-backfill meta filter", slog.Any("err", err))
+				}
+				return nil
+			})
+		}, func(error) {
+			log.Info("Stopping thanos-backfill meta filter updates")
+			cancel()
+		})
+		return thanosBackfillMetaFilter, nil
+	default:
+		return nil, fmt.Errorf("unknown meta filter type: %s", opts.filterType)
+	}
+}
+
+func setupSyncer(ctx context.Context, g *run.Group, log *slog.Logger, bkt objstore.Bucket, discoverer *locate.Discoverer, metaFilter locate.MetaFilter, opts syncerOpts) (*locate.Syncer, error) {
+	syncer := locate.NewSyncer(
+		bkt,
+		locate.FilterMetas(metaFilter),
+		locate.BlockConcurrency(opts.syncerConcurrency),
+		locate.BlockOptions(
+			locate.ReadBufferSize(opts.syncerReadBufferSize),
+			locate.LabelFilesDir(opts.syncerLabelFilesDir),
+		),
+	)
+
+	log.Info("Running initial sync")
+
+	iterCtx, iterCancel := context.WithTimeout(ctx, opts.syncerInterval)
+	defer iterCancel()
+	if err := syncer.Sync(iterCtx, discoverer.Metas()); err != nil {
+		return nil, fmt.Errorf("unable to run initial sync: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	g.Add(func() error {
+		return runutil.Repeat(opts.syncerInterval, ctx.Done(), func() error {
+			log.Debug("Running sync")
+
+			iterCtx, iterCancel := context.WithTimeout(ctx, opts.syncerInterval)
+			defer iterCancel()
+			if err := syncer.Sync(iterCtx, discoverer.Metas()); err != nil {
+				log.Warn("Unable to sync new blocks", slog.Any("err", err))
+			}
+			return nil
+		})
+	}, func(error) {
+		log.Info("Stopping syncer")
+		cancel()
+	})
+	return syncer, nil
 }

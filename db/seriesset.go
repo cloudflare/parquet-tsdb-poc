@@ -8,13 +8,13 @@ import (
 	"context"
 	"sync"
 
-	"github.com/hashicorp/go-multierror"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
 type hints struct {
+	Limit    int
 	By       bool
 	Func     string
 	Grouping []string
@@ -24,6 +24,7 @@ func fromStorageHints(h *storage.SelectHints) hints {
 	clone := make([]string, len(h.Grouping))
 	copy(clone, h.Grouping)
 	return hints{
+		Limit:    h.Limit,
 		Func:     h.Func,
 		By:       h.By,
 		Grouping: clone,
@@ -31,7 +32,7 @@ func fromStorageHints(h *storage.SelectHints) hints {
 }
 
 func toStorageHints(h hints) *storage.SelectHints {
-	return &storage.SelectHints{Func: h.Func, By: h.By, Grouping: h.Grouping}
+	return &storage.SelectHints{Limit: h.Limit, Func: h.Func, By: h.By, Grouping: h.Grouping}
 }
 
 type selectFn func(context.Context, bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet
@@ -91,48 +92,6 @@ func (c *lazySeriesSet) Warnings() annotations.Annotations {
 	return c.set.Warnings()
 }
 
-type verticalSeriesSet struct {
-	i    int
-	sets []storage.SeriesSet
-}
-
-func newVerticalSeriesSet(sets ...storage.SeriesSet) storage.SeriesSet {
-	if len(sets) == 0 {
-		return storage.EmptySeriesSet()
-	}
-	return &verticalSeriesSet{sets: sets, i: 0}
-}
-
-func (ss *verticalSeriesSet) Next() bool {
-	if ss.sets[ss.i].Next() {
-		return true
-	}
-	for ss.i < len(ss.sets)-1 {
-		ss.i++
-		if ss.sets[ss.i].Next() {
-			return true
-		}
-	}
-	return false
-}
-
-func (ss *verticalSeriesSet) At() storage.Series { return ss.sets[ss.i].At() }
-func (ss *verticalSeriesSet) Err() error {
-	var err *multierror.Error
-	for i := range ss.sets {
-		err = multierror.Append(err, ss.sets[i].Err())
-	}
-	return err.ErrorOrNil()
-}
-
-func (ss *verticalSeriesSet) Warnings() annotations.Annotations {
-	res := annotations.New()
-	for i := range ss.sets {
-		res.Merge(ss.sets[i].Warnings())
-	}
-	return *res
-}
-
 type concatSeriesSet struct {
 	i      int
 	series []storage.Series
@@ -156,3 +115,18 @@ func (ss *concatSeriesSet) Next() bool {
 func (ss *concatSeriesSet) At() storage.Series                { return ss.series[ss.i] }
 func (ss *concatSeriesSet) Err() error                        { return nil }
 func (ss *concatSeriesSet) Warnings() annotations.Annotations { return nil }
+
+type warningsSeriesSet struct {
+	storage.SeriesSet
+
+	warns annotations.Annotations
+}
+
+func newWarningsSeriesSet(ss storage.SeriesSet, warns annotations.Annotations) storage.SeriesSet {
+	return &warningsSeriesSet{SeriesSet: ss, warns: warns}
+}
+
+func (ss *warningsSeriesSet) Warnings() annotations.Annotations {
+	original := ss.SeriesSet.Warnings()
+	return original.Merge(ss.warns)
+}

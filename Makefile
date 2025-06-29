@@ -1,29 +1,39 @@
-.PHONY: all build proto lint test
+.PHONY: all ci build proto lint test-norace test deps
 
 all: build
 
-build: proto parquet-gateway
+ci: test-norace build lint
+
+build: protos parquet-gateway
 
 GO = go
-GOIMPORTS = goimports
-REVIVE = revive
+GOTOOL = $(GO) tool -modfile=go.tools.mod
+GOIMPORTS = $(GOTOOL) golang.org/x/tools/cmd/goimports
+REVIVE = $(GOTOOL) github.com/mgechev/revive
+MODERNIZE = $(GOTOOL) golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize
 PROTOC = protoc
 
 lint: $(wildcard **/*.go)
 	@echo ">> running lint..."
-	@$(REVIVE) -config revive.toml ./...
+	$(REVIVE) -config revive.toml ./...
+	$(MODERNIZE) -test ./...
 	find . -name '*.go' ! -path './proto/*' | xargs $(GOIMPORTS) -l -w -local $(head -n 1 go.mod | cut -d ' ' -f 2)
+
+test-norace: $(wildcard **/*.go)
+	@echo ">> running tests without checking for races..."
+	@mkdir -p .cover
+	$(GO) test -v -tags stringlabels -short -count=1 ./... -coverprofile .cover/cover.out
 
 test: $(wildcard **/*.go)
 	@echo ">> running tests..."
 	@mkdir -p .cover
-	$(GO) test -v -race -count=1 ./... -coverprofile .cover/cover.out
+	$(GO) test -v -tags stringlabels -race -short -count=1 ./... -coverprofile .cover/cover.out
 
-parquet-gateway: $(wildcard **/*.go)
+parquet-gateway: $(shell find . -type f -name '*.go')
 	@echo ">> building binaries..."
-	@$(GO) build -o parquet-gateway github.com/cloudflare/parquet-tsdb-poc/cmd
+	@$(GO) build -tags stringlabels -o parquet-gateway github.com/cloudflare/parquet-tsdb-poc/cmd
 
-proto: proto/metapb/meta.pb.go
+protos: proto/metapb/meta.pb.go
 
 proto/metapb/meta.pb.go: proto/metapb/meta.proto
 	@echo ">> compiling protos..."

@@ -5,7 +5,7 @@ pkgs.mkShell {
   name = "env";
   hardeningDisable = [ "fortify" ];
   buildInputs = with pkgs; [
-    go_1_23
+    go_1_24
     gotools
     delve
     revive

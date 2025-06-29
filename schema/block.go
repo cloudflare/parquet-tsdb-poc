@@ -17,6 +17,14 @@ const (
 	dateFormat = "%04d/%02d/%02d"
 )
 
+type Meta struct {
+	Version        int
+	Name           string
+	Mint, Maxt     int64
+	Shards         int64
+	ColumnsForName map[string][]string
+}
+
 func SplitBlockPath(name string) (string, string, bool) {
 	var (
 		year, month, day int
@@ -30,6 +38,21 @@ func SplitBlockPath(name string) (string, string, bool) {
 		return "", "", false
 	}
 	return filepath.Dir(name), file, true
+}
+
+func DayFromBlockName(blk string) (time.Time, error) {
+	var (
+		year, month, day int
+	)
+	n, err := fmt.Sscanf(blk, dateFormat, &year, &month, &day)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("unable to read timestamp from block name: %w", err)
+	}
+	if n != 3 {
+		return time.Time{}, fmt.Errorf("unexpected number of date atoms parsed: %d != 3", n)
+	}
+
+	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC), nil
 }
 
 func BlockNameForDay(t time.Time) (string, error) {

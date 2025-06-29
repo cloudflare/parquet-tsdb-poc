@@ -38,7 +38,7 @@ This will:
 - load blocks from the `.data/my-prefix` directory
 - expose internal metrics and readiness handlers on port 6060
 - expose a subset of the Prometheus HTTP API on port 9090
-- expose an Thanos Info and Query gRPC service on port 9091
+- expose an Thanos Info, Series and Query gRPC service on port 9091
 
 You can now query it by pointing a Thanos Querier at it or through curl:
 
@@ -73,6 +73,10 @@ To convert TSDB blocks in the `.data/source` directory that overlap `09/2021` an
 parquet-gateway convert \
     --tsdb.storage.prefix source \
     --parquet.storage.prefix destination \
-    --convert.start=2021-09-01T00:00:00Z \
-    --convert.end=2021-10-01T00:00:00Z
+    --convert.sorting.label=__name__ \
+    --convert.sorting.label=namespace
 ```
+
+## Note
+
+The code has significant overlap with the work in "https://github.com/prometheus-community/parquet-common". We are in the process of upstreaming and eventually plan to use it as a library.

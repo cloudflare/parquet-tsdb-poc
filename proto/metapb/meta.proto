@@ -9,6 +9,7 @@ message Metadata {
   int64 maxt = 2;
   int64 shards = 3;
   map<string, Columns> columnsForName = 4;
+  int64 version = 5;
 }
 
 message Columns {

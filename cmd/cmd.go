@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,11 +14,14 @@ import (
 	"syscall"
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
-	"github.com/hashicorp/go-multierror"
 	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/alecthomas/kingpin.v2"
 
+	"github.com/cloudflare/parquet-tsdb-poc/api/grpc"
+	"github.com/cloudflare/parquet-tsdb-poc/api/http"
+	"github.com/cloudflare/parquet-tsdb-poc/convert"
 	"github.com/cloudflare/parquet-tsdb-poc/db"
+	"github.com/cloudflare/parquet-tsdb-poc/locate"
 	"github.com/cloudflare/parquet-tsdb-poc/search"
 )
 
@@ -29,7 +33,7 @@ var logLevelMap = map[string]slog.Level{
 }
 
 func main() {
-	app := kingpin.New("parquet-tsdb-poc", "A POC for a TSDB in parquet.")
+	app := kingpin.New("parquet-gateway", "parquet metrics experiments")
 	memratio := app.Flag("memlimit.ratio", "gomemlimit ratio").Default("0.9").Float()
 	logLevel := app.Flag("logger.level", "log level").Default("INFO").Enum("DEBUG", "INFO", "WARN", "ERROR")
 
@@ -70,7 +74,7 @@ func main() {
 	switch parsed {
 	case tsdbConvert.FullCommand():
 		log.Info("Running convert")
-		if err := tsdbConvertF(ctx, log); err != nil {
+		if err := tsdbConvertF(ctx, log, reg); err != nil {
 			log.Error("Error converting tsdb block", slog.Any("err", err))
 			os.Exit(1)
 		}
@@ -88,11 +92,14 @@ func setupPrometheusRegistry() (*prometheus.Registry, error) {
 	reg := prometheus.NewRegistry()
 	registerer := prometheus.WrapRegistererWithPrefix("cf_metrics_", reg)
 
-	if err := multierror.Append(
-		nil,
-		db.RegisterMetrics(prometheus.WrapRegistererWithPrefix("db_", registerer)),
+	if err := errors.Join(
+		locate.RegisterMetrics(prometheus.WrapRegistererWithPrefix("locate_", registerer)),
 		search.RegisterMetrics(prometheus.WrapRegistererWithPrefix("search_", registerer)),
-	); err.ErrorOrNil() != nil {
+		convert.RegisterMetrics(prometheus.WrapRegistererWithPrefix("convert_", registerer)),
+		db.RegisterMetrics(prometheus.WrapRegistererWithPrefix("db_", registerer)),
+		http.RegisterMetrics(prometheus.WrapRegistererWithPrefix("http_", registerer)),
+		grpc.RegisterMetrics(prometheus.WrapRegistererWithPrefix("grpc_", registerer)),
+	); err != nil {
 		return nil, fmt.Errorf("unable to register metrics: %w", err)
 	}
 	return reg, nil

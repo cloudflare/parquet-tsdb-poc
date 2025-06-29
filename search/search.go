@@ -6,431 +6,385 @@ package search
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"strings"
+	"sync"
 
-	"github.com/hashicorp/go-multierror"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/parquet-go/parquet-go"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/util/annotations"
 
-	"github.com/cloudflare/parquet-tsdb-poc/internal/tracing"
+	"github.com/cloudflare/parquet-tsdb-poc/internal/limits"
+	"github.com/cloudflare/parquet-tsdb-poc/internal/util"
+	"github.com/cloudflare/parquet-tsdb-poc/internal/warnings"
 	"github.com/cloudflare/parquet-tsdb-poc/schema"
 )
 
-type Constraint interface {
-	// rowRanges returns a set of non-overlapping increasing row indexes that may satisfy the constraint.
-	rowRanges(rg parquet.RowGroup) ([]rowRange, error)
-	// accept returns if this constraint is satisfied by the row.
-	accept(r parquet.Row) bool
-	// init initializes the constraint with respect to the file schema and projections.
-	init(s *parquet.Schema) error
+type SeriesChunks struct {
+	LsetHash uint64
+	Lset     labels.Labels
+	Chunks   []chunks.Meta
 }
 
-type RowReaderCloser interface {
-	parquet.RowReader
-	io.Closer
+type SelectReadMeta struct {
+	// The actual data for this Select call and metadata for how to read it
+	Meta       schema.Meta
+	LabelPfile *parquet.File
+	ChunkPfile *parquet.File
+
+	// We smuggle a bucket reader here so we can create a prepared ReaderAt
+	// for chunks that is scoped to this query and can be traced.
+	ChunkFileReaderFromContext func(ctx context.Context) io.ReaderAt
+
+	// Quotas for the query that issued this Select call
+	ChunkBytesQuota *limits.Quota
+	RowCountQuota   *limits.Quota
+
+	// Hints about how we should partition page ranges for chunks.
+	// Page ranges are coalesced into a partition that is more efficient
+	// to read in object storage. I.e we will merge adjacent (up to a max gap) Pages
+	// into bigger ranges (up to a max size). These ranges are scheduled to be read
+	// concurrently.
+	ChunkPagePartitionMaxRange       uint64
+	ChunkPagePartitionMaxGap         uint64
+	ChunkPagePartitionMaxConcurrency int
+
+	// Thanos labels processing hints
+	ExternalLabels    labels.Labels
+	ReplicaLabelNames []string
 }
 
-func Match(
+func Select(
 	ctx context.Context,
-	c Constraint,
-	labelPfile *parquet.File,
-	labelSchema *parquet.Schema,
-	chunkPfile *parquet.File,
-	chunkSchema *parquet.Schema,
-) (RowReaderCloser, error) {
-	ctx, span := tracing.Tracer().Start(ctx, "Match")
-	defer span.End()
+	meta SelectReadMeta,
+	mint int64,
+	maxt int64,
+	hints *storage.SelectHints,
+	ms ...*labels.Matcher,
+) ([]SeriesChunks, annotations.Annotations, error) {
+	ctx = contextWithMethod(ctx, methodSelect)
 
-	labelRowGroups := labelPfile.RowGroups()
-	chunkRowGroups := chunkPfile.RowGroups()
-
-	joinedSchema := schema.Joined(labelSchema, chunkSchema)
-	if err := c.init(joinedSchema); err != nil {
-		return nil, fmt.Errorf("unable to initialize constraints: %w", err)
+	ms, ok := matchExternalLabels(meta.ExternalLabels, ms)
+	if !ok {
+		return nil, nil, nil
 	}
 
 	// label and chunk files have same number of rows and rowgroups, just pick either
+	labelRowGroups := meta.LabelPfile.RowGroups()
 	numRowGroups := len(labelRowGroups)
 
-	rrs := make([]RowReaderCloser, 0, numRowGroups)
-	for i := 0; i != numRowGroups; i++ {
-		ranges, err := c.rowRanges(labelRowGroups[i])
-		if err != nil {
-			return nil, fmt.Errorf("unable to compute ranges for row group: %w", err)
-		}
-		if len(ranges) == 0 {
-			continue
-		}
+	var (
+		mu    sync.Mutex
+		annos annotations.Annotations
+	)
 
-		columnChunks := make([]parquet.ColumnChunk, 0, len(joinedSchema.Columns()))
-		for _, p := range joinedSchema.Columns() {
-			if col, ok := labelRowGroups[i].Schema().Lookup(p...); ok {
-				columnChunks = append(columnChunks, labelRowGroups[i].ColumnChunks()[col.ColumnIndex])
-			} else if col, ok := chunkRowGroups[i].Schema().Lookup(p...); ok {
-				columnChunks = append(columnChunks, chunkRowGroups[i].ColumnChunks()[col.ColumnIndex])
-			} else {
-				// nothing to read here really
+	res := make([]SeriesChunks, 0)
+
+	g, ctx := errgroup.WithContext(ctx)
+	for i := range numRowGroups {
+		g.Go(func() error {
+			cs, err := matchersToConstraint(ms...)
+			if err != nil {
+				return fmt.Errorf("unable to convert matchers to constraints: %w", err)
+			}
+			if err := initialize(meta.LabelPfile.Schema(), cs...); err != nil {
+				return fmt.Errorf("unable to initialize constraints: %w", err)
+			}
+
+			rrs, err := filter(ctx, labelRowGroups[i], cs...)
+			if err != nil {
+				return fmt.Errorf("unable to compute ranges: %w", err)
+			}
+			if len(rrs) == 0 {
+				return nil
+			}
+			series, warns, err := materializeSeries(
+				ctx,
+				meta,
+				i,
+				mint,
+				maxt,
+				hints,
+				rrs,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to materialize series: %w", err)
+			}
+
+			mu.Lock()
+			res = append(res, series...)
+			annos = annos.Merge(warns)
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, annos, fmt.Errorf("unable to process row groups: %w", err)
+	}
+	return res, annos, nil
+}
+
+type LabelValuesReadMeta struct {
+	// The actual data for this LabelValues call and metadata for how to read it
+	Meta       schema.Meta
+	LabelPfile *parquet.File
+
+	// Thanos labels processing hints
+	ExternalLabels    labels.Labels
+	ReplicaLabelNames []string
+}
+
+func LabelValues(
+	ctx context.Context,
+	meta LabelValuesReadMeta,
+	name string,
+	hints *storage.LabelHints,
+	ms ...*labels.Matcher,
+) ([]string, annotations.Annotations, error) {
+	ctx = contextWithMethod(ctx, methodLabelValues)
+
+	ms, ok := matchExternalLabels(meta.ExternalLabels, ms)
+	if !ok {
+		return nil, nil, nil
+	}
+	extVal := externalLabelValues(meta.ExternalLabels, meta.ReplicaLabelNames, name)
+
+	var (
+		res   []string
+		annos annotations.Annotations
+	)
+
+	if len(ms) == 0 {
+		// No matchers means we can read label values from the column dictionaries
+		vals := make([]string, 0)
+		for _, rg := range meta.LabelPfile.RowGroups() {
+			lc, ok := rg.Schema().Lookup(schema.LabelNameToColumn(name))
+			if !ok {
 				continue
 			}
-		}
-		rrs = append(rrs, newRangesRowReader(ranges, newRowGroupRows(joinedSchema, columnChunks)))
-	}
-	return newFilterRowReader(newConcatRowReader(rrs), c.accept), nil
-}
+			pg := rg.ColumnChunks()[lc.ColumnIndex].Pages()
+			defer pg.Close()
 
-type rangesRowReader struct {
-	ranges []rowRange
-	rows   parquet.Rows
-
-	n       int
-	rMaxRow int
-	rCurRow int
-}
-
-func newRangesRowReader(ranges []rowRange, rows parquet.Rows) *rangesRowReader {
-	return &rangesRowReader{ranges: ranges, rows: rows, n: -1}
-}
-
-func (r *rangesRowReader) next() error {
-	if r.n == len(r.ranges)-1 {
-		return io.EOF
-	}
-	r.n++
-	r.rMaxRow = int(r.ranges[r.n].count)
-	r.rCurRow = 0
-	return r.rows.SeekToRow(r.ranges[r.n].from)
-}
-
-func (r *rangesRowReader) ReadRows(buf []parquet.Row) (int, error) {
-	canRead := r.rMaxRow - r.rCurRow
-	if canRead == 0 {
-		if err := r.next(); err != nil {
-			return 0, err
-		}
-		canRead = r.rMaxRow - r.rCurRow
-	}
-	buf = buf[:min(len(buf), canRead)]
-
-	n, err := r.rows.ReadRows(buf)
-	if err != nil {
-		return n, err
-	}
-	r.rCurRow += n
-	return n, err
-
-}
-
-func (r *rangesRowReader) Close() error {
-	return r.rows.Close()
-}
-
-type concatRowReader struct {
-	idx int
-	rrs []RowReaderCloser
-}
-
-func newConcatRowReader(rrs []RowReaderCloser) *concatRowReader {
-	return &concatRowReader{rrs: rrs}
-}
-
-func (f *concatRowReader) ReadRows(r []parquet.Row) (int, error) {
-	if f.idx >= len(f.rrs) {
-		return 0, io.EOF
-	}
-	n := 0
-	for n != len(r) && f.idx != len(f.rrs) {
-		m, err := f.rrs[f.idx].ReadRows(r[n:])
-		n += m
-		if err != nil {
-			if err == io.EOF {
-				f.idx++
-			} else {
-				return n, err
-			}
-		}
-	}
-	if n != len(r) {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
-func (f *concatRowReader) Close() error {
-	var err *multierror.Error
-	for i := range f.rrs {
-		err = multierror.Append(err, f.rrs[i].Close())
-	}
-	return err.ErrorOrNil()
-}
-
-type filterRowReader struct {
-	rr     parquet.RowReader
-	closer io.Closer
-}
-
-func newFilterRowReader(rr RowReaderCloser, accept func(r parquet.Row) bool) *filterRowReader {
-	return &filterRowReader{rr: parquet.FilterRowReader(rr, accept), closer: rr}
-}
-
-func (f *filterRowReader) ReadRows(r []parquet.Row) (int, error) {
-	return f.rr.ReadRows(r)
-}
-
-func (f *filterRowReader) Close() error {
-	return f.closer.Close()
-}
-
-// Copied from parquet-go https://github.com/parquet-go/parquet-go/blob/main/row_group.go
-// Needs to be upstreamed eventually; Adapted to work with column chunks and joined schema
-
-type columnChunkValueReader struct {
-	pages   parquet.Pages
-	page    parquet.Page
-	values  parquet.ValueReader
-	release func(parquet.Page)
-}
-
-func (r *columnChunkValueReader) clear() {
-	if r.page != nil {
-		r.release(r.page)
-		r.page = nil
-		r.values = nil
-	}
-}
-
-func (r *columnChunkValueReader) Reset() {
-	if r.pages != nil {
-		// Ignore errors because we are resetting the reader, if the error
-		// persists we will see it on the next read, and otherwise we can
-		// read back from the beginning.
-		r.pages.SeekToRow(0)
-	}
-	r.clear()
-}
-
-func (r *columnChunkValueReader) Close() error {
-	var err error
-	if r.pages != nil {
-		err = r.pages.Close()
-		r.pages = nil
-	}
-	r.clear()
-	return err
-}
-
-func (r *columnChunkValueReader) ReadValues(values []parquet.Value) (int, error) {
-	if r.pages == nil {
-		return 0, io.EOF
-	}
-
-	for {
-		if r.values == nil {
-			p, err := r.pages.ReadPage()
+			p, err := pg.ReadPage()
 			if err != nil {
-				return 0, err
+				return nil, annos, fmt.Errorf("unable to read page: %w", err)
 			}
-			r.page = p
-			r.values = p.Values()
-		}
+			d := p.Dictionary()
 
-		n, err := r.values.ReadValues(values)
-		if n > 0 {
-			return n, nil
-		}
-		if err == nil {
-			return 0, io.ErrNoProgress
-		}
-		if err != io.EOF {
-			return 0, err
-		}
-		r.clear()
-	}
-}
-
-func (r *columnChunkValueReader) SeekToRow(rowIndex int64) error {
-	if r.pages == nil {
-		return io.ErrClosedPipe
-	}
-	if err := r.pages.SeekToRow(rowIndex); err != nil {
-		return err
-	}
-	r.clear()
-	return nil
-}
-
-type rowGroupRows struct {
-	schema   *parquet.Schema
-	bufsize  int
-	buffers  []parquet.Value
-	columns  []columnChunkRows
-	closed   bool
-	rowIndex int64
-}
-
-type columnChunkRows struct {
-	offset int32
-	length int32
-	reader columnChunkValueReader
-}
-
-func (r *rowGroupRows) buffer(i int) []parquet.Value {
-	j := (i + 0) * r.bufsize
-	k := (i + 1) * r.bufsize
-	return r.buffers[j:k:k]
-}
-
-func newRowGroupRows(schema *parquet.Schema, columns []parquet.ColumnChunk) *rowGroupRows {
-	bufferSize := 64
-	r := &rowGroupRows{
-		schema:   schema,
-		bufsize:  bufferSize,
-		buffers:  make([]parquet.Value, len(columns)*bufferSize),
-		columns:  make([]columnChunkRows, len(columns)),
-		rowIndex: -1,
-	}
-
-	for i, column := range columns {
-		var release func(parquet.Page)
-		// Only release pages that are not byte array because the values
-		// that were read from the page might be retained by the program
-		// after calls to ReadRows.
-		switch column.Type().Kind() {
-		case parquet.ByteArray, parquet.FixedLenByteArray:
-			release = func(parquet.Page) {}
-		default:
-			release = parquet.Release
-		}
-		r.columns[i].reader.release = release
-		r.columns[i].reader.pages = column.Pages()
-	}
-	return r
-}
-
-func (r *rowGroupRows) clear() {
-	for i, c := range r.columns {
-		r.columns[i] = columnChunkRows{reader: c.reader}
-	}
-	clear(r.buffers)
-}
-
-func (r *rowGroupRows) Reset() {
-	for i := range r.columns {
-		r.columns[i].reader.Reset()
-	}
-	r.clear()
-}
-
-func (r *rowGroupRows) Close() error {
-	var errs []error
-	for i := range r.columns {
-		c := &r.columns[i]
-		c.offset = 0
-		c.length = 0
-		if err := c.reader.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	r.clear()
-	r.closed = true
-	return errors.Join(errs...)
-}
-
-func (r *rowGroupRows) SeekToRow(rowIndex int64) error {
-	if r.closed {
-		return io.ErrClosedPipe
-	}
-	if rowIndex != r.rowIndex {
-		for i := range r.columns {
-			if err := r.columns[i].reader.SeekToRow(rowIndex); err != nil {
-				return err
+			for i := range d.Len() {
+				vals = append(vals, d.Index(int32(i)).Clone().String())
 			}
 		}
-		r.clear()
-		r.rowIndex = rowIndex
-	}
-	return nil
-}
-
-func (r *rowGroupRows) ReadRows(rows []parquet.Row) (int, error) {
-	if r.closed {
-		return 0, io.EOF
-	}
-
-	for rowIndex := range rows {
-		rows[rowIndex] = rows[rowIndex][:0]
-	}
-
-	// When this is the first call to ReadRows, we issue a seek to the first row
-	// because this starts prefetching pages asynchronously on columns.
-	//
-	// This condition does not apply if SeekToRow was called before ReadRows,
-	// only when ReadRows is the very first method called on the row reader.
-	if r.rowIndex < 0 {
-		if err := r.SeekToRow(0); err != nil {
-			return 0, err
+		if len(extVal) != 0 {
+			if len(vals) != 0 {
+				annos = annos.Add(warnings.ErrorDroppedLabelValuesAfterExternalLabelMangling)
+			}
+			res = append(res, extVal)
+		} else {
+			res = append(res, vals...)
 		}
-	}
+	} else {
+		// matchers means we need to actually read values of the column
+		labelRowGroups := meta.LabelPfile.RowGroups()
+		numRowGroups := len(labelRowGroups)
 
-	eofCount := 0
-	rowCount := 0
+		var mu sync.Mutex
 
-readColumnValues:
-	for columnIndex := range r.columns {
-		c := &r.columns[columnIndex]
-		b := r.buffer(columnIndex)
-		eof := false
+		g, ctx := errgroup.WithContext(ctx)
+		for i := range numRowGroups {
+			g.Go(func() error {
+				cs, err := matchersToConstraint(ms...)
+				if err != nil {
+					return fmt.Errorf("unable to convert matchers to constraints: %w", err)
+				}
+				if err := initialize(meta.LabelPfile.Schema(), cs...); err != nil {
+					return fmt.Errorf("unable to initialize constraints: %w", err)
+				}
 
-		for rowIndex := range rows {
-			numValuesInRow := 1
+				rrs, err := filter(ctx, labelRowGroups[i], cs...)
+				if err != nil {
+					return fmt.Errorf("unable to compute ranges: %w", err)
+				}
+				if len(rrs) == 0 {
+					return nil
+				}
 
-			for {
-				if c.offset == c.length {
-					n, err := c.reader.ReadValues(b)
-					c.offset = 0
-					c.length = int32(n)
+				labelValues, warns, err := materializeLabelValues(ctx, meta, name, i, rrs)
+				if err != nil {
+					return fmt.Errorf("unable to materialize label values: %w", err)
+				}
 
-					if n == 0 {
-						if err == io.EOF {
-							eof = true
-							eofCount++
-							break
-						}
-						return 0, err
+				mu.Lock()
+				defer mu.Unlock()
+
+				annos = annos.Merge(warns)
+
+				if len(extVal) != 0 {
+					if len(labelValues) != 0 {
+						annos = annos.Add(warnings.ErrorDroppedLabelValuesAfterExternalLabelMangling)
 					}
+					res = append(res, extVal)
+				} else {
+					res = append(res, labelValues...)
 				}
+				return nil
+			})
+		}
 
-				values := b[c.offset:c.length:c.length]
-				for numValuesInRow < len(values) && values[numValuesInRow].RepetitionLevel() != 0 {
-					numValuesInRow++
-				}
-				if numValuesInRow == 0 {
-					break
-				}
-
-				rows[rowIndex] = append(rows[rowIndex], values[:numValuesInRow]...)
-				rowCount = max(rowCount, rowIndex+1)
-				c.offset += int32(numValuesInRow)
-
-				if numValuesInRow != len(values) {
-					break
-				}
-				if eof {
-					continue readColumnValues
-				}
-				numValuesInRow = 0
-			}
+		if err := g.Wait(); err != nil {
+			return nil, annos, fmt.Errorf("unable to process row groups: %w", err)
 		}
 	}
+	limit := hints.Limit
 
-	var err error
-	if eofCount > 0 {
-		err = io.EOF
+	res = util.SortUnique(res)
+	if limit > 0 && len(res) > limit {
+		res = res[:limit]
+		annos = annos.Add(warnings.ErrorTruncatedResponse)
 	}
-	r.rowIndex += int64(rowCount)
-	return rowCount, err
+	return res, annos, nil
 }
 
-func (r *rowGroupRows) Schema() *parquet.Schema {
-	return r.schema
+type LabelNamesReadMeta struct {
+	// The actual data for this LabelNames call and metadata for how to read it
+	Meta       schema.Meta
+	LabelPfile *parquet.File
+
+	// Thanos labels processing hints
+	ExternalLabels    labels.Labels
+	ReplicaLabelNames []string
+}
+
+func LabelNames(
+	ctx context.Context,
+	meta LabelNamesReadMeta,
+	hints *storage.LabelHints,
+	ms ...*labels.Matcher,
+) ([]string, annotations.Annotations, error) {
+	ctx = contextWithMethod(ctx, methodLabelNames)
+
+	ms, ok := matchExternalLabels(meta.ExternalLabels, ms)
+	if !ok {
+		return nil, nil, nil
+	}
+	var (
+		res   []string
+		annos annotations.Annotations
+	)
+
+	if len(ms) == 0 {
+		// No matchers means we can read label names from the schema
+		for _, c := range meta.LabelPfile.Schema().Columns() {
+			if strings.HasPrefix(c[0], schema.LabelColumnPrefix) {
+				res = append(res, schema.ColumnToLabelName(c[0]))
+			}
+		}
+		res = append(res, externalLabelNames(meta.ExternalLabels, meta.ReplicaLabelNames)...)
+	} else {
+		// matchers means we need to fetch label names for matching rows from the table
+		labelRowGroups := meta.LabelPfile.RowGroups()
+		numRowGroups := len(labelRowGroups)
+
+		var mu sync.Mutex
+
+		g, ctx := errgroup.WithContext(ctx)
+		for i := range numRowGroups {
+			g.Go(func() error {
+				cs, err := matchersToConstraint(ms...)
+				if err != nil {
+					return fmt.Errorf("unable to convert matchers to constraints: %w", err)
+				}
+				if err := initialize(meta.LabelPfile.Schema(), cs...); err != nil {
+					return fmt.Errorf("unable to initialize constraints: %w", err)
+				}
+
+				rrs, err := filter(ctx, labelRowGroups[i], cs...)
+				if err != nil {
+					return fmt.Errorf("unable to compute ranges: %w", err)
+				}
+				if len(rrs) == 0 {
+					return nil
+				}
+				labelNames, warns, err := materializeLabelNames(ctx, meta, i, rrs)
+				if err != nil {
+					return fmt.Errorf("unable to materialize label names: %w", err)
+				}
+
+				mu.Lock()
+				defer mu.Unlock()
+
+				res = append(res, externalLabelNames(meta.ExternalLabels, meta.ReplicaLabelNames)...)
+				res = append(res, labelNames...)
+				annos = annos.Merge(warns)
+
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, annos, fmt.Errorf("unable to process row groups: %w", err)
+		}
+	}
+	limit := hints.Limit
+
+	res = util.SortUnique(res)
+	if limit > 0 && len(res) > limit {
+		res = res[:limit]
+		annos = annos.Add(warnings.ErrorTruncatedResponse)
+	}
+	return res, annos, nil
+}
+
+func matchExternalLabels(extLabels labels.Labels, matchers []*labels.Matcher) ([]*labels.Matcher, bool) {
+	// if the matchers match on some external label, we need to consume that matcher here
+	remain := make([]*labels.Matcher, 0, len(matchers))
+	for i := range matchers {
+		exclude, consumed := false, false
+		extLabels.Range(func(lbl labels.Label) {
+			if matchers[i].Name != lbl.Name {
+				return
+			}
+			exclude = exclude || !matchers[i].Matches(lbl.Value)
+			consumed = true
+		})
+		if exclude {
+			return nil, false
+		}
+		if !consumed {
+			remain = append(remain, matchers[i])
+		}
+	}
+	return remain, true
+}
+
+func externalLabelValues(extLabels labels.Labels, replicaLabelNames []string, name string) string {
+	extVal := ""
+	extLabels.Range(func(lbl labels.Label) {
+		if slices.Contains(replicaLabelNames, lbl.Name) {
+			return
+		}
+		if lbl.Name != name {
+			return
+		}
+		extVal = lbl.Value
+	})
+	return extVal
+}
+
+func externalLabelNames(extLabels labels.Labels, replicaLabelNames []string) []string {
+	res := make([]string, 0, extLabels.Len())
+	extLabels.Range(func(lbl labels.Label) {
+		if slices.Contains(replicaLabelNames, lbl.Name) {
+			return
+		}
+		res = append(res, lbl.Name)
+	})
+	return res
 }

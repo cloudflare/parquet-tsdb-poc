@@ -16,15 +16,6 @@ import (
 	"github.com/cloudflare/parquet-tsdb-poc/schema"
 )
 
-func allChunksEmpty(chkBytes [schema.ChunkColumnsPerDay][]byte) bool {
-	for _, chk := range chkBytes {
-		if len(chk) != 0 {
-			return false
-		}
-	}
-	return true
-}
-
 func collectChunks(it chunks.Iterator) ([schema.ChunkColumnsPerDay][]byte, error) {
 	var (
 		res [schema.ChunkColumnsPerDay][]byte
@@ -44,8 +35,10 @@ func collectChunks(it chunks.Iterator) ([schema.ChunkColumnsPerDay][]byte, error
 		return chunks[i].MinTime < chunks[j].MinTime
 	})
 	for _, chk := range chunks {
+		if chk.Chunk.NumSamples() == 0 {
+			continue
+		}
 		enc, bs := chk.Chunk.Encoding(), chk.Chunk.Bytes()
-
 		hour := time.UnixMilli(chk.MinTime).UTC().Hour()
 		chkIdx := (hour / int(schema.ChunkColumnLength.Hours())) % schema.ChunkColumnsPerDay
 		chkBytes := res[chkIdx]

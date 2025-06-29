@@ -13,7 +13,6 @@ warningCode = 1
 [rule.error-naming]
 [rule.if-return]
 [rule.increment-decrement]
-[rule.var-naming]
 [rule.var-declaration]
 [rule.range]
 [rule.receiver-naming]
@@ -27,4 +26,6 @@ warningCode = 1
 [rule.redefines-builtin-id]
 [rule.file-header]
   arguments = ["Copyright \\(c\\) 2025 Cloudflare, Inc."]
+[rule.var-naming]
+arguments = [[], [], [{ skip-package-name-checks = true }]]
 
